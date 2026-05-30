@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -55,17 +56,21 @@ type Model struct {
 
 	cursor   int
 	showHelp bool
+	grouped  bool
 	status   string
 
 	form     form
 	tagInput textinput.Model
 
+	onChange func()
+
 	width  int
 	height int
 }
 
-// New создаёт модель из хранилища.
-func New(s *store.Store) (Model, error) {
+// New создаёт модель из хранилища. onChange (может быть nil) вызывается
+// после успешного сохранения — например, чтобы обновить модуль waybar.
+func New(s *store.Store, onChange func()) (Model, error) {
 	tasks, err := s.Load()
 	if err != nil {
 		return Model{}, err
@@ -78,14 +83,22 @@ func New(s *store.Store) (Model, error) {
 		tasks:    tasks,
 		filter:   filterAll,
 		sort:     store.SortPriority,
+		grouped:  true,
 		tagInput: ti,
+		onChange: onChange,
 	}, nil
 }
 
 func (m Model) Init() tea.Cmd { return nil }
 
-// visible возвращает задачи после фильтра/тега и сортировки.
-func (m Model) visible() []model.Task {
+// taskGroup — задачи одного главного тега.
+type taskGroup struct {
+	tag   string // "" — без тегов
+	tasks []model.Task
+}
+
+// filtered возвращает задачи после фильтра и фильтра-по-тегу (без сортировки).
+func (m Model) filtered() []model.Task {
 	out := make([]model.Task, 0, len(m.tasks))
 	for _, t := range m.tasks {
 		switch m.filter {
@@ -103,8 +116,55 @@ func (m Model) visible() []model.Task {
 		}
 		out = append(out, t)
 	}
-	store.Sort(out, m.sort)
 	return out
+}
+
+// groupedVisible группирует видимые задачи по главному тегу.
+// Группы — по алфавиту, «без тегов» в конце; внутри группы — по m.sort.
+func (m Model) groupedVisible() []taskGroup {
+	buckets := map[string][]model.Task{}
+	for _, t := range m.filtered() {
+		k := t.MainTag()
+		buckets[k] = append(buckets[k], t)
+	}
+	keys := make([]string, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sortTagKeys(keys)
+
+	groups := make([]taskGroup, 0, len(keys))
+	for _, k := range keys {
+		ts := buckets[k]
+		store.Sort(ts, m.sort)
+		groups = append(groups, taskGroup{tag: k, tasks: ts})
+	}
+	return groups
+}
+
+// visible возвращает видимые задачи в порядке отображения.
+// Курсор индексирует именно этот плоский порядок.
+func (m Model) visible() []model.Task {
+	if !m.grouped {
+		out := m.filtered()
+		store.Sort(out, m.sort)
+		return out
+	}
+	var out []model.Task
+	for _, g := range m.groupedVisible() {
+		out = append(out, g.tasks...)
+	}
+	return out
+}
+
+// sortTagKeys сортирует имена тегов по алфавиту, пустой ключ («без тегов») — в конец.
+func sortTagKeys(keys []string) {
+	sort.Slice(keys, func(i, j int) bool {
+		if (keys[i] == "") != (keys[j] == "") {
+			return keys[j] == ""
+		}
+		return strings.ToLower(keys[i]) < strings.ToLower(keys[j])
+	})
 }
 
 func (m *Model) clampCursor(n int) {
@@ -123,6 +183,10 @@ func (m *Model) clampCursor(n int) {
 func (m *Model) persist() {
 	if err := m.store.Save(m.tasks); err != nil {
 		m.status = "ошибка сохранения: " + err.Error()
+		return
+	}
+	if m.onChange != nil {
+		m.onChange()
 	}
 }
 
@@ -216,6 +280,14 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		m.sort = m.sort.Next()
 		m.status = "сортировка: " + m.sort.String()
+	case "f":
+		m.grouped = !m.grouped
+		m.clampCursor(len(m.visible()))
+		if m.grouped {
+			m.status = "режим: группы по тегам"
+		} else {
+			m.status = "режим: плоский список"
+		}
 	case "/":
 		m.mode = modeTagInput
 		m.tagInput.SetValue(m.tagFilter)
@@ -243,11 +315,11 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 		m.status = "текст задачи не может быть пустым"
 		return m, m.form.applyFocus()
 	}
-	if deadline != "" {
-		if _, err := time.Parse(model.DeadlineLayout, deadline); err != nil {
-			m.status = "дедлайн в формате YYYY-MM-DD"
-			return m, nil
-		}
+	now := time.Now()
+	stored, err := model.ParseDeadlineInput(deadline, now)
+	if err != nil {
+		m.status = err.Error()
+		return m, nil
 	}
 
 	if m.form.editingID == "" {
@@ -256,15 +328,15 @@ func (m Model) submitForm() (tea.Model, tea.Cmd) {
 			Text:      text,
 			Priority:  prio,
 			Tags:      tags,
-			Deadline:  deadline,
-			CreatedAt: time.Now().UTC(),
+			Deadline:  stored,
+			CreatedAt: now.UTC(),
 		})
 		m.status = "задача добавлена"
 	} else if i := m.taskIndex(m.form.editingID); i >= 0 {
 		m.tasks[i].Text = text
 		m.tasks[i].Priority = prio
 		m.tasks[i].Tags = tags
-		m.tasks[i].Deadline = deadline
+		m.tasks[i].Deadline = stored
 		m.status = "задача обновлена"
 	}
 	m.persist()
@@ -317,7 +389,12 @@ func (m Model) View() string {
 func (m Model) headerView() string {
 	filterPart := filterStyle.Render(m.filter.String())
 	sortPart := "sort:" + m.sort.String()
-	header := fmt.Sprintf("%s   фильтр: %s   %s", titleStyle.Render(" gtodo "), filterPart, headerStyle.Render(sortPart))
+	viewPart := "группы"
+	if !m.grouped {
+		viewPart = "плоский"
+	}
+	header := fmt.Sprintf("%s   фильтр: %s   %s   %s",
+		titleStyle.Render(" gtodo "), filterPart, headerStyle.Render(sortPart), headerStyle.Render(viewPart))
 	if m.tagFilter != "" {
 		header += headerStyle.Render("#" + m.tagFilter)
 	}
@@ -325,68 +402,120 @@ func (m Model) headerView() string {
 }
 
 func (m Model) listView() string {
-	vis := m.visible()
-	if len(vis) == 0 {
+	if !m.grouped {
+		return m.flatListView()
+	}
+
+	groups := m.groupedVisible()
+	total := 0
+	for _, g := range groups {
+		total += len(g.tasks)
+	}
+	if total == 0 {
 		return normalLineStyle.Render("  — нет задач —")
 	}
 
 	var b strings.Builder
 	now := time.Now()
-	for i, t := range vis {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = cursorStyle.Render("▌ ")
+	idx := 0
+	for _, g := range groups {
+		b.WriteString(groupHeaderView(g.tag, len(g.tasks)) + "\n")
+		for _, t := range g.tasks {
+			b.WriteString(m.taskLine(t, idx, now) + "\n")
+			idx++
 		}
-
-		box := "[ ]"
-		if t.Done {
-			box = "[x]"
-		}
-
-		line := fmt.Sprintf("%s %s %s", box, priorityBadge(t.Priority), t.Text)
-
-		lineStyle := normalLineStyle
-		if t.Done {
-			lineStyle = doneLineStyle
-		} else if i == m.cursor {
-			lineStyle = selectedLineStyle
-		}
-		rendered := cursor + lineStyle.Render(line)
-
-		if len(t.Tags) > 0 {
-			rendered += " " + tagStyle.Render("["+strings.Join(t.Tags, " ")+"]")
-		}
-		if d, ok := t.DeadlineTime(); ok {
-			rendered += " " + deadlineView(t, d, now)
-		}
-		b.WriteString(rendered + "\n")
 	}
 	return b.String()
 }
 
-func deadlineView(t model.Task, d, now time.Time) string {
-	label := "→ " + d.Format("02 Jan")
+func (m Model) flatListView() string {
+	vis := m.visible()
+	if len(vis) == 0 {
+		return normalLineStyle.Render("  — нет задач —")
+	}
+	var b strings.Builder
+	now := time.Now()
+	for i, t := range vis {
+		b.WriteString(m.taskLine(t, i, now) + "\n")
+	}
+	return b.String()
+}
+
+func groupHeaderView(tag string, n int) string {
+	name := tag
+	if name == "" {
+		name = "без тегов"
+	}
+	return groupHeaderStyle.Render(name) + " " + groupCountStyle.Render(fmt.Sprintf("(%d)", n))
+}
+
+// taskLine рендерит одну задачу с отступом под заголовком группы. i — её
+// позиция в плоском порядке (для курсора).
+func (m Model) taskLine(t model.Task, i int, now time.Time) string {
+	// В режиме групп задачи с отступом под заголовком; в плоском — без отступа.
+	marker := "  "
+	cursorMark := cursorStyle.Render("▌ ")
+	if m.grouped {
+		marker = "     "
+		cursorMark = "   " + cursorStyle.Render("▌ ")
+	}
+	if i == m.cursor {
+		marker = cursorMark
+	}
+
+	box := "[ ]"
+	if t.Done {
+		box = "[x]"
+	}
+
+	lineStyle := normalLineStyle
+	if t.Done {
+		lineStyle = doneLineStyle
+	} else if i == m.cursor {
+		lineStyle = selectedLineStyle
+	}
+
+	// В группах главный тег — это заголовок, поэтому в строке только подтеги.
+	// В плоском режиме показываем все теги, чтобы не терять контекст.
+	tagLabel := t.SubTagsLabel()
+	if !m.grouped {
+		tagLabel = t.AllTagsLabel()
+	}
+
+	seg := box + " " + priorityBadge(t.Priority) + " "
+	if tagLabel != "" {
+		seg += tagStyle.Render(tagLabel) + " "
+	}
+	seg += lineStyle.Render(t.Text)
+
+	out := marker + seg
+	if label := t.DeadlineLabel(now); label != "" {
+		out += " " + deadlineView(t, label)
+	}
+	return out
+}
+
+func deadlineView(t model.Task, label string) string {
 	st := lipgloss.NewStyle().Foreground(colSubtle)
 	switch {
 	case t.Overdue():
 		st = lipgloss.NewStyle().Foreground(colOverdue).Bold(true)
 	case t.DueToday():
 		st = lipgloss.NewStyle().Foreground(colToday).Bold(true)
-		label = "→ сегодня"
 	}
-	return st.Render(label)
+	return st.Render("→ " + label)
 }
 
 func (m Model) footerView() string {
 	if m.showHelp {
 		return helpStyle.Render(fullHelp)
 	}
-	return helpStyle.Render("j/k — навигация • space — done • a — добавить • e — правка • d — удалить • ? — помощь • q — выход")
+	return helpStyle.Render("j/k — навигация • space — done • a — добавить • e — правка • d — удалить • f — группы/плоский • ? — помощь • q — выход")
 }
 
 const fullHelp = "Навигация:  j/↓ вниз   k/↑ вверх   g/G начало/конец\n" +
 	"Действия:   space toggle done   a добавить   e правка   t теги   d удалить   p приоритет\n" +
-	"Вид:        Tab фильтр (All/Active/Done)   s сортировка   / фильтр по тегу\n" +
+	"Вид:        Tab фильтр (All/Active/Done)   s сортировка   f группы/плоский   / фильтр по тегу\n" +
 	"Прочее:     ? помощь   q/Esc выход"
 
 func current(vis []model.Task, cursor int) (model.Task, bool) {

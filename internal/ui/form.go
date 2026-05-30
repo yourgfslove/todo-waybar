@@ -54,7 +54,7 @@ func newForm(task *model.Task) form {
 		focus:    fieldText,
 		text:     mk("Текст задачи", 200),
 		tags:     mk("work, home", 100),
-		deadline: mk("YYYY-MM-DD", 10),
+		deadline: mk("2d3h30m или YYYY-MM-DD", 30),
 		priority: model.PriorityMid,
 	}
 
@@ -63,7 +63,7 @@ func newForm(task *model.Task) form {
 		f.editingID = task.ID
 		f.text.SetValue(task.Text)
 		f.tags.SetValue(strings.Join(task.Tags, ", "))
-		f.deadline.SetValue(task.Deadline)
+		f.deadline.SetValue(task.DeadlineEditValue())
 		if task.Priority.Valid() {
 			f.priority = task.Priority
 		}

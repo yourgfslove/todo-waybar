@@ -39,6 +39,13 @@ var (
 
 	tagStyle = lipgloss.NewStyle().Foreground(colAccent)
 
+	groupHeaderStyle = lipgloss.NewStyle().
+				Foreground(colAccent).
+				Bold(true).
+				Underline(true)
+
+	groupCountStyle = lipgloss.NewStyle().Foreground(colSubtle)
+
 	helpStyle = lipgloss.NewStyle().Foreground(colSubtle).Padding(1, 1, 0, 1)
 
 	statusStyle = lipgloss.NewStyle().Foreground(colMid).Padding(0, 1)

@@ -14,7 +14,7 @@ func init() {
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			s := mustStore()
-			m, err := ui.New(s)
+			m, err := ui.New(s, notifyWaybar)
 			if err != nil {
 				return err
 			}

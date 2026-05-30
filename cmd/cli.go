@@ -28,6 +28,7 @@ func addCmd() *cobra.Command {
 		priority string
 		tags     []string
 		deadline string
+		in       string
 	)
 	cmd := &cobra.Command{
 		Use:   "add <text>",
@@ -38,11 +39,27 @@ func addCmd() *cobra.Command {
 			if !p.Valid() {
 				return fmt.Errorf("недопустимый приоритет %q (ожидается high/mid/low)", priority)
 			}
-			if deadline != "" {
-				if _, err := time.Parse(model.DeadlineLayout, deadline); err != nil {
-					return fmt.Errorf("неверный дедлайн %q (ожидается YYYY-MM-DD)", deadline)
+			if deadline != "" && in != "" {
+				return fmt.Errorf("укажите либо --deadline, либо --in, но не оба")
+			}
+
+			now := time.Now()
+			stored := ""
+			switch {
+			case in != "":
+				dur, err := model.ParseDuration(in)
+				if err != nil {
+					return fmt.Errorf("неверный срок --in: %w", err)
+				}
+				stored = now.Add(dur).UTC().Format(time.RFC3339)
+			case deadline != "":
+				var err error
+				stored, err = model.ParseDeadlineInput(deadline, now)
+				if err != nil {
+					return err
 				}
 			}
+
 			s := mustStore()
 			tasks, err := s.Load()
 			if err != nil {
@@ -53,20 +70,22 @@ func addCmd() *cobra.Command {
 				Text:      args[0],
 				Priority:  p,
 				Tags:      normalizeTags(tags),
-				Deadline:  deadline,
-				CreatedAt: time.Now().UTC(),
+				Deadline:  stored,
+				CreatedAt: now.UTC(),
 			}
 			tasks = append(tasks, task)
 			if err := s.Save(tasks); err != nil {
 				return err
 			}
+			notifyWaybar()
 			fmt.Println(task.ID)
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&priority, "priority", "p", string(model.PriorityMid), "приоритет: high/mid/low")
 	cmd.Flags().StringSliceVarP(&tags, "tags", "t", nil, "теги через запятую")
-	cmd.Flags().StringVarP(&deadline, "deadline", "d", "", "дедлайн YYYY-MM-DD")
+	cmd.Flags().StringVarP(&deadline, "deadline", "d", "", "дедлайн: YYYY-MM-DD или \"YYYY-MM-DD HH:MM\"")
+	cmd.Flags().StringVarP(&in, "in", "i", "", "срок от создания: напр. 2d3h30m, 45m, 1w")
 	return cmd
 }
 
@@ -146,6 +165,7 @@ func rmCmd() *cobra.Command {
 			if err := s.Save(tasks); err != nil {
 				return err
 			}
+			notifyWaybar()
 			fmt.Println("удалено:", id)
 			return nil
 		},
@@ -186,6 +206,7 @@ func setDone(id string, done bool) error {
 	if err := s.Save(tasks); err != nil {
 		return err
 	}
+	notifyWaybar()
 	fmt.Println(tasks[i].ID)
 	return nil
 }
@@ -243,8 +264,8 @@ func formatTaskLine(t model.Task) string {
 	if len(t.Tags) > 0 {
 		parts = append(parts, "["+strings.Join(t.Tags, ",")+"]")
 	}
-	if t.Deadline != "" {
-		parts = append(parts, "→ "+t.Deadline)
+	if label := t.DeadlineLabel(time.Now()); label != "" {
+		parts = append(parts, "→ "+label)
 	}
 	return strings.Join(parts, " ")
 }
